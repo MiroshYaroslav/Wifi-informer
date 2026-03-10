@@ -1,0 +1,6 @@
+.pio
+.idea/
+cmake-build-*/
+*.bin
+*.elf
+include/secrets.h
