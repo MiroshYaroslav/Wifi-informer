@@ -37,6 +37,7 @@ constexpr int16_t kTouchMaxY = 3800;
 
 constexpr size_t kDrawBufferSize = kScreenWidth * kScreenHeight / 10;
 constexpr size_t kJsonCapacity = JSON_OBJECT_SIZE(4) + 128;
+
 constexpr uint32_t kNetworkTaskStackSize = 8192;
 constexpr UBaseType_t kNetworkTaskPriority = 1;
 
@@ -44,7 +45,7 @@ TFT_eSPI tft;
 SPIClass touchSpi(HSPI);
 XPT2046_Touchscreen touch(kTouchCs, kTouchIrq);
 
-lv_disp_draw_buf_t drawBuffer;
+lv_disp_draw_buf_t drawBuffer{};
 lv_color_t drawBufferPixels[kDrawBufferSize];
 
 lv_obj_t* labelTime = nullptr;
@@ -53,20 +54,32 @@ lv_obj_t* labelFinance = nullptr;
 lv_obj_t* labelDev = nullptr;
 
 SemaphoreHandle_t guiMutex = nullptr;
+TaskHandle_t networkTaskHandle = nullptr;
+
 uint32_t lastLvglTickMs = 0;
 }  // namespace
 
-void lockGui() {
-    if (guiMutex != nullptr) {
-        xSemaphoreTake(guiMutex, portMAX_DELAY);
+class GuiLockGuard final {
+public:
+    GuiLockGuard() {
+        if (guiMutex != nullptr) {
+            xSemaphoreTake(guiMutex, portMAX_DELAY);
+            locked_ = true;
+        }
     }
-}
 
-void unlockGui() {
-    if (guiMutex != nullptr) {
-        xSemaphoreGive(guiMutex);
+    ~GuiLockGuard() {
+        if (locked_) {
+            xSemaphoreGive(guiMutex);
+        }
     }
-}
+
+    GuiLockGuard(const GuiLockGuard&) = delete;
+    GuiLockGuard& operator=(const GuiLockGuard&) = delete;
+
+private:
+    bool locked_ = false;
+};
 
 void setLabelText(lv_obj_t* label, const char* text) {
     if (label != nullptr) {
@@ -75,22 +88,52 @@ void setLabelText(lv_obj_t* label, const char* text) {
 }
 
 void setLabelTextSafe(lv_obj_t* label, const char* text) {
-    lockGui();
+    GuiLockGuard lock;
     setLabelText(label, text);
-    unlockGui();
+}
+
+[[noreturn]] void haltForever() {
+    for (;;) {
+        delay(1000);
+    }
+}
+
+[[noreturn]] void haltSystem(const char* message) {
+    Serial.println(message);
+
+    if (guiMutex != nullptr && labelDev != nullptr) {
+        if (xSemaphoreTake(guiMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            lv_label_set_text(labelDev, message);
+            xSemaphoreGive(guiMutex);
+        }
+    }
+
+    haltForever();
 }
 
 bool isWiFiConnected() {
+    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
     return WiFi.status() == WL_CONNECTED;
 }
 
 void startWiFiStation() {
+    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
     WiFi.mode(WIFI_STA);
+    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
+    WiFi.setAutoReconnect(true);
+    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
+    WiFi.persistent(false);
+    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
+    WiFi.setSleep(false);
+    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
     WiFi.begin(kSsid, kPassword);
 }
 
 void reconnectWiFi() {
-    WiFi.reconnect();
+    if (!isWiFiConnected()) {
+        // NOLINTNEXTLINE(readability-static-accessed-through-instance)
+        WiFi.reconnect();
+    }
 }
 
 void updateLvglTick() {
@@ -101,6 +144,13 @@ void updateLvglTick() {
     if (elapsed > 0) {
         lv_tick_inc(elapsed);
     }
+}
+
+void pumpUiOnce() {
+    updateLvglTick();
+
+    GuiLockGuard lock;
+    lv_timer_handler();
 }
 
 void displayFlush(lv_disp_drv_t* dispDrv, const lv_area_t* area, lv_color_t* colorPtr) {
@@ -134,6 +184,8 @@ void touchpadRead(lv_indev_drv_t*, lv_indev_data_t* data) {
 }
 
 void buildUi() {
+    GuiLockGuard lock;
+
     lv_obj_t* tabview = lv_tabview_create(lv_scr_act(), LV_DIR_TOP, 40);
 
     lv_obj_t* tabClock = lv_tabview_add_tab(tabview, "Clock");
@@ -158,6 +210,25 @@ void buildUi() {
     lv_obj_align(labelDev, LV_ALIGN_CENTER, 0, 0);
 }
 
+void updateDashboardLabels(
+    const char* timeText,
+    const char* weatherText,
+    const char* usdText,
+    const char* serverStatusText
+) {
+    char financeText[24];
+    char devText[32];
+
+    snprintf(financeText, sizeof(financeText), "USD: %s", usdText);
+    snprintf(devText, sizeof(devText), "Server: %s", serverStatusText);
+
+    GuiLockGuard lock;
+    setLabelText(labelTime, timeText);
+    setLabelText(labelWeather, weatherText);
+    setLabelText(labelFinance, financeText);
+    setLabelText(labelDev, devText);
+}
+
 void connectToWiFi() {
     if (isWiFiConnected()) {
         return;
@@ -169,12 +240,7 @@ void connectToWiFi() {
     const uint32_t startMs = millis();
 
     while (!isWiFiConnected() && (millis() - startMs) < kWifiConnectTimeoutMs) {
-        updateLvglTick();
-
-        lockGui();
-        lv_timer_handler();
-        unlockGui();
-
+        pumpUiOnce();
         delay(kUiLoopDelayMs);
     }
 
@@ -185,20 +251,6 @@ void connectToWiFi() {
         Serial.println("WiFi connection failed");
         setLabelTextSafe(labelDev, "WiFi: failed");
     }
-}
-
-void updateDashboardLabels(
-    const char* timeText,
-    const char* weatherText,
-    const char* financeText,
-    const char* devText
-) {
-    lockGui();
-    setLabelText(labelTime, timeText);
-    setLabelText(labelWeather, weatherText);
-    setLabelText(labelFinance, financeText);
-    setLabelText(labelDev, devText);
-    unlockGui();
 }
 
 void fetchDataFromServer() {
@@ -242,21 +294,10 @@ void fetchDataFromServer() {
     const char* usdText = doc["usd"] | "N/A";
     const char* serverStatusText = doc["status"] | "Online";
 
-    String financeText = "USD: ";
-    financeText += usdText;
-
-    String devText = "Server: ";
-    devText += serverStatusText;
-
-    updateDashboardLabels(
-        timeText,
-        weatherText,
-        financeText.c_str(),
-        devText.c_str()
-    );
+    updateDashboardLabels(timeText, weatherText, usdText, serverStatusText);
 }
 
-void networkTask(void*) {
+[[noreturn]] void runNetworkLoop() {
     for (;;) {
         if (!isWiFiConnected()) {
             reconnectWiFi();
@@ -268,6 +309,10 @@ void networkTask(void*) {
         fetchDataFromServer();
         vTaskDelay(pdMS_TO_TICKS(kUpdateIntervalMs));
     }
+}
+
+void networkTask(void*) {
+    runNetworkLoop();
 }
 
 void setupDisplayAndTouch() {
@@ -308,23 +353,24 @@ void setupLvgl() {
 void setupGuiMutex() {
     guiMutex = xSemaphoreCreateMutex();
     if (guiMutex == nullptr) {
-        Serial.println("Failed to create GUI mutex");
-        while (true) {
-            delay(1000);
-        }
+        haltSystem("Fatal: GUI mutex failed");
     }
 }
 
 void setupNetworkTask() {
-    xTaskCreatePinnedToCore(
+    const BaseType_t result = xTaskCreatePinnedToCore(
         networkTask,
         "NetworkTask",
         kNetworkTaskStackSize,
         nullptr,
         kNetworkTaskPriority,
-        nullptr,
+        &networkTaskHandle,
         0
     );
+
+    if (result != pdPASS || networkTaskHandle == nullptr) {
+        haltSystem("Fatal: Network task failed");
+    }
 }
 
 void setup() {
@@ -342,11 +388,6 @@ void setup() {
 }
 
 void loop() {
-    updateLvglTick();
-
-    lockGui();
-    lv_timer_handler();
-    unlockGui();
-
+    pumpUiOnce();
     delay(kUiLoopDelayMs);
 }
