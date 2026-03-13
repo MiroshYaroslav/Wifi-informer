@@ -6,9 +6,13 @@
 #include <lvgl.h>
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+
+#include "secrets.h"
 
 namespace {
-#include "secrets.h"
 constexpr char kServerUrl[] = "http://192.168.1.100:8000/api/dashboard";
 
 constexpr uint16_t kScreenWidth = 320;
@@ -17,7 +21,8 @@ constexpr uint16_t kScreenHeight = 240;
 constexpr uint32_t kUpdateIntervalMs = 60000;
 constexpr uint32_t kWifiConnectTimeoutMs = 10000;
 constexpr uint16_t kHttpTimeoutMs = 3000;
-constexpr uint16_t kLoopDelayMs = 5;
+constexpr uint16_t kUiLoopDelayMs = 5;
+constexpr uint32_t kReconnectDelayMs = 5000;
 
 constexpr uint8_t kTouchIrq = 36;
 constexpr uint8_t kTouchMosi = 32;
@@ -32,6 +37,8 @@ constexpr int16_t kTouchMaxY = 3800;
 
 constexpr size_t kDrawBufferSize = kScreenWidth * kScreenHeight / 10;
 constexpr size_t kJsonCapacity = JSON_OBJECT_SIZE(4) + 128;
+constexpr uint32_t kNetworkTaskStackSize = 8192;
+constexpr UBaseType_t kNetworkTaskPriority = 1;
 
 TFT_eSPI tft;
 SPIClass touchSpi(HSPI);
@@ -45,9 +52,21 @@ lv_obj_t* labelWeather = nullptr;
 lv_obj_t* labelFinance = nullptr;
 lv_obj_t* labelDev = nullptr;
 
-uint32_t lastDataUpdateMs = 0;
+SemaphoreHandle_t guiMutex = nullptr;
 uint32_t lastLvglTickMs = 0;
 }  // namespace
+
+void lockGui() {
+    if (guiMutex != nullptr) {
+        xSemaphoreTake(guiMutex, portMAX_DELAY);
+    }
+}
+
+void unlockGui() {
+    if (guiMutex != nullptr) {
+        xSemaphoreGive(guiMutex);
+    }
+}
 
 void setLabelText(lv_obj_t* label, const char* text) {
     if (label != nullptr) {
@@ -55,20 +74,22 @@ void setLabelText(lv_obj_t* label, const char* text) {
     }
 }
 
+void setLabelTextSafe(lv_obj_t* label, const char* text) {
+    lockGui();
+    setLabelText(label, text);
+    unlockGui();
+}
+
 bool isWiFiConnected() {
-    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
     return WiFi.status() == WL_CONNECTED;
 }
 
 void startWiFiStation() {
-    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
     WiFi.mode(WIFI_STA);
-    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
     WiFi.begin(kSsid, kPassword);
 }
 
 void reconnectWiFi() {
-    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
     WiFi.reconnect();
 }
 
@@ -80,8 +101,6 @@ void updateLvglTick() {
     if (elapsed > 0) {
         lv_tick_inc(elapsed);
     }
-
-    lv_timer_handler();
 }
 
 void displayFlush(lv_disp_drv_t* dispDrv, const lv_area_t* area, lv_color_t* colorPtr) {
@@ -97,7 +116,7 @@ void displayFlush(lv_disp_drv_t* dispDrv, const lv_area_t* area, lv_color_t* col
 }
 
 void touchpadRead(lv_indev_drv_t*, lv_indev_data_t* data) {
-    if (!touch.tirqTouched() || !touch.touched()) {
+    if (!touch.touched()) {
         data->state = LV_INDEV_STATE_REL;
         return;
     }
@@ -145,27 +164,46 @@ void connectToWiFi() {
     }
 
     startWiFiStation();
-    setLabelText(labelDev, "WiFi: connecting...");
+    setLabelTextSafe(labelDev, "WiFi: connecting...");
 
     const uint32_t startMs = millis();
 
     while (!isWiFiConnected() && (millis() - startMs) < kWifiConnectTimeoutMs) {
         updateLvglTick();
-        delay(kLoopDelayMs);
+
+        lockGui();
+        lv_timer_handler();
+        unlockGui();
+
+        delay(kUiLoopDelayMs);
     }
 
     if (isWiFiConnected()) {
         Serial.println("WiFi connected");
-        setLabelText(labelDev, "Server: waiting...");
+        setLabelTextSafe(labelDev, "Server: waiting...");
     } else {
         Serial.println("WiFi connection failed");
-        setLabelText(labelDev, "WiFi: failed");
+        setLabelTextSafe(labelDev, "WiFi: failed");
     }
+}
+
+void updateDashboardLabels(
+    const char* timeText,
+    const char* weatherText,
+    const char* financeText,
+    const char* devText
+) {
+    lockGui();
+    setLabelText(labelTime, timeText);
+    setLabelText(labelWeather, weatherText);
+    setLabelText(labelFinance, financeText);
+    setLabelText(labelDev, devText);
+    unlockGui();
 }
 
 void fetchDataFromServer() {
     if (!isWiFiConnected()) {
-        setLabelText(labelDev, "WiFi: offline");
+        setLabelTextSafe(labelDev, "WiFi: offline");
         return;
     }
 
@@ -175,7 +213,7 @@ void fetchDataFromServer() {
 
     if (!http.begin(kServerUrl)) {
         Serial.println("HTTP begin failed");
-        setLabelText(labelDev, "HTTP: init failed");
+        setLabelTextSafe(labelDev, "HTTP: init failed");
         return;
     }
 
@@ -183,19 +221,19 @@ void fetchDataFromServer() {
 
     if (httpResponseCode != HTTP_CODE_OK) {
         Serial.printf("HTTP error: %d\n", httpResponseCode);
-        setLabelText(labelDev, "Server: offline");
+        setLabelTextSafe(labelDev, "Server: offline");
         http.end();
         return;
     }
 
     StaticJsonDocument<kJsonCapacity> doc;
     const DeserializationError error = deserializeJson(doc, http.getStream());
+    http.end();
 
     if (error) {
         Serial.print("JSON parse failed: ");
         Serial.println(error.c_str());
-        setLabelText(labelDev, "JSON: parse error");
-        http.end();
+        setLabelTextSafe(labelDev, "JSON: parse error");
         return;
     }
 
@@ -210,12 +248,26 @@ void fetchDataFromServer() {
     String devText = "Server: ";
     devText += serverStatusText;
 
-    setLabelText(labelTime, timeText);
-    setLabelText(labelWeather, weatherText);
-    setLabelText(labelFinance, financeText.c_str());
-    setLabelText(labelDev, devText.c_str());
+    updateDashboardLabels(
+        timeText,
+        weatherText,
+        financeText.c_str(),
+        devText.c_str()
+    );
+}
 
-    http.end();
+void networkTask(void*) {
+    for (;;) {
+        if (!isWiFiConnected()) {
+            reconnectWiFi();
+            setLabelTextSafe(labelDev, "WiFi: reconnecting...");
+            vTaskDelay(pdMS_TO_TICKS(kReconnectDelayMs));
+            continue;
+        }
+
+        fetchDataFromServer();
+        vTaskDelay(pdMS_TO_TICKS(kUpdateIntervalMs));
+    }
 }
 
 void setupDisplayAndTouch() {
@@ -253,9 +305,32 @@ void setupLvgl() {
     lv_indev_drv_register(&indevDrv);
 }
 
+void setupGuiMutex() {
+    guiMutex = xSemaphoreCreateMutex();
+    if (guiMutex == nullptr) {
+        Serial.println("Failed to create GUI mutex");
+        while (true) {
+            delay(1000);
+        }
+    }
+}
+
+void setupNetworkTask() {
+    xTaskCreatePinnedToCore(
+        networkTask,
+        "NetworkTask",
+        kNetworkTaskStackSize,
+        nullptr,
+        kNetworkTaskPriority,
+        nullptr,
+        0
+    );
+}
+
 void setup() {
     Serial.begin(115200);
 
+    setupGuiMutex();
     setupDisplayAndTouch();
     setupLvgl();
     buildUi();
@@ -263,22 +338,15 @@ void setup() {
     lastLvglTickMs = millis();
 
     connectToWiFi();
-    fetchDataFromServer();
-    lastDataUpdateMs = millis();
+    setupNetworkTask();
 }
 
 void loop() {
     updateLvglTick();
 
-    if (!isWiFiConnected()) {
-        reconnectWiFi();
-        setLabelText(labelDev, "WiFi: reconnecting...");
-    }
+    lockGui();
+    lv_timer_handler();
+    unlockGui();
 
-    if (millis() - lastDataUpdateMs >= kUpdateIntervalMs) {
-        fetchDataFromServer();
-        lastDataUpdateMs = millis();
-    }
-
-    delay(kLoopDelayMs);
+    delay(kUiLoopDelayMs);
 }
