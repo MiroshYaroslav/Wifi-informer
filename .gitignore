@@ -4,3 +4,4 @@ cmake-build-*/
 *.bin
 *.elf
 include/secrets.h
+.vscode

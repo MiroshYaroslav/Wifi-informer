@@ -20,8 +20,8 @@ constexpr uint16_t kScreenHeight = 240;
 
 constexpr uint32_t kUpdateIntervalMs = 60000;
 constexpr uint32_t kWifiConnectTimeoutMs = 10000;
-constexpr uint16_t kHttpTimeoutMs = 3000;
-constexpr uint16_t kUiLoopDelayMs = 5;
+constexpr uint16_t kHttpTimeoutMs = 2500;
+constexpr uint16_t kUiLoopDelayMs = 2;
 constexpr uint32_t kReconnectDelayMs = 5000;
 
 constexpr uint8_t kTouchIrq = 36;
@@ -30,15 +30,20 @@ constexpr uint8_t kTouchMiso = 39;
 constexpr uint8_t kTouchClk = 25;
 constexpr uint8_t kTouchCs = 33;
 
-constexpr int16_t kTouchMinX = 200;
-constexpr int16_t kTouchMaxX = 3800;
-constexpr int16_t kTouchMinY = 200;
-constexpr int16_t kTouchMaxY = 3800;
+constexpr int16_t kTouchRawMinX = 200;
+constexpr int16_t kTouchRawMaxX = 3800;
+constexpr int16_t kTouchRawMinY = 200;
+constexpr int16_t kTouchRawMaxY = 3800;
 
-constexpr size_t kDrawBufferSize = kScreenWidth * kScreenHeight / 10;
+constexpr bool kTouchSwapXY = false;
+constexpr bool kTouchInvertX = false;
+constexpr bool kTouchInvertY = false;
+
+constexpr uint16_t kDrawBufferLines = 25;
+constexpr size_t kDrawBufferSize = kScreenWidth * kDrawBufferLines;
 constexpr size_t kJsonCapacity = JSON_OBJECT_SIZE(4) + 128;
 
-constexpr uint32_t kNetworkTaskStackSize = 8192;
+constexpr uint32_t kNetworkTaskStackSize = 6144;
 constexpr UBaseType_t kNetworkTaskPriority = 1;
 
 TFT_eSPI tft;
@@ -53,87 +58,123 @@ lv_obj_t* labelWeather = nullptr;
 lv_obj_t* labelFinance = nullptr;
 lv_obj_t* labelDev = nullptr;
 
-SemaphoreHandle_t guiMutex = nullptr;
+SemaphoreHandle_t dataMutex = nullptr;
 TaskHandle_t networkTaskHandle = nullptr;
 
 uint32_t lastLvglTickMs = 0;
-}  // namespace
 
-class GuiLockGuard final {
+struct DashboardData {
+    char time[8];
+    char weather[32];
+    char usd[16];
+    char status[24];
+    bool dirty;
+};
+
+DashboardData sharedData{
+    "--:--",
+    "Loading weather...",
+    "N/A",
+    "starting...",
+    false
+};
+}
+
+class DataLockGuard final {
 public:
-    GuiLockGuard() {
-        if (guiMutex != nullptr) {
-            xSemaphoreTake(guiMutex, portMAX_DELAY);
+    DataLockGuard() {
+        if (dataMutex != nullptr) {
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
             locked_ = true;
         }
     }
 
-    ~GuiLockGuard() {
+    ~DataLockGuard() {
         if (locked_) {
-            xSemaphoreGive(guiMutex);
+            xSemaphoreGive(dataMutex);
         }
     }
 
-    GuiLockGuard(const GuiLockGuard&) = delete;
-    GuiLockGuard& operator=(const GuiLockGuard&) = delete;
+    DataLockGuard(const DataLockGuard&) = delete;
+    DataLockGuard& operator=(const DataLockGuard&) = delete;
 
 private:
     bool locked_ = false;
 };
 
-void setLabelText(lv_obj_t* label, const char* text) {
-    if (label != nullptr) {
-        lv_label_set_text(label, text);
+template <size_t N>
+void copyText(char (&dst)[N], const char* src) {
+    if (src == nullptr) {
+        dst[0] = '\0';
+        return;
     }
+    snprintf(dst, N, "%s", src);
 }
 
-void setLabelTextSafe(lv_obj_t* label, const char* text) {
-    GuiLockGuard lock;
-    setLabelText(label, text);
+int32_t median3(const int32_t a, const int32_t b, const int32_t c) {
+    if ((a <= b && b <= c) || (c <= b && b <= a)) {
+        return b;
+    }
+    if ((b <= a && a <= c) || (c <= a && a <= b)) {
+        return a;
+    }
+    return c;
 }
 
-[[noreturn]] void haltForever() {
+[[noreturn]] void haltSystem(const char* message) {
+    Serial.println(message);
     for (;;) {
         delay(1000);
     }
 }
 
-[[noreturn]] void haltSystem(const char* message) {
-    Serial.println(message);
-
-    if (guiMutex != nullptr && labelDev != nullptr) {
-        if (xSemaphoreTake(guiMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            lv_label_set_text(labelDev, message);
-            xSemaphoreGive(guiMutex);
-        }
-    }
-
-    haltForever();
-}
-
 bool isWiFiConnected() {
-    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
     return WiFi.status() == WL_CONNECTED;
 }
 
 void startWiFiStation() {
-    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
     WiFi.mode(WIFI_STA);
-    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
     WiFi.setAutoReconnect(true);
-    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
     WiFi.persistent(false);
-    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
     WiFi.setSleep(false);
-    // NOLINTNEXTLINE(readability-static-accessed-through-instance)
     WiFi.begin(kSsid, kPassword);
 }
 
 void reconnectWiFi() {
     if (!isWiFiConnected()) {
-        // NOLINTNEXTLINE(readability-static-accessed-through-instance)
         WiFi.reconnect();
     }
+}
+
+void setPendingStatus(const char* statusText) {
+    DataLockGuard lock;
+    copyText(sharedData.status, statusText);
+    sharedData.dirty = true;
+}
+
+void setPendingDashboardData(
+    const char* timeText,
+    const char* weatherText,
+    const char* usdText,
+    const char* statusText
+) {
+    DataLockGuard lock;
+    copyText(sharedData.time, timeText);
+    copyText(sharedData.weather, weatherText);
+    copyText(sharedData.usd, usdText);
+    copyText(sharedData.status, statusText);
+    sharedData.dirty = true;
+}
+
+bool takePendingDashboardData(DashboardData& out) {
+    DataLockGuard lock;
+    if (!sharedData.dirty) {
+        return false;
+    }
+
+    out = sharedData;
+    sharedData.dirty = false;
+    return true;
 }
 
 void updateLvglTick() {
@@ -144,13 +185,6 @@ void updateLvglTick() {
     if (elapsed > 0) {
         lv_tick_inc(elapsed);
     }
-}
-
-void pumpUiOnce() {
-    updateLvglTick();
-
-    GuiLockGuard lock;
-    lv_timer_handler();
 }
 
 void displayFlush(lv_disp_drv_t* dispDrv, const lv_area_t* area, lv_color_t* colorPtr) {
@@ -166,27 +200,68 @@ void displayFlush(lv_disp_drv_t* dispDrv, const lv_area_t* area, lv_color_t* col
 }
 
 void touchpadRead(lv_indev_drv_t*, lv_indev_data_t* data) {
+    static int32_t lastX = 0;
+    static int32_t lastY = 0;
+    static bool active = false;
+
     if (!touch.touched()) {
+        data->point.x = static_cast<lv_coord_t>(lastX);
+        data->point.y = static_cast<lv_coord_t>(lastY);
         data->state = LV_INDEV_STATE_REL;
+        active = false;
         return;
     }
 
-    const TS_Point point = touch.getPoint();
+    const TS_Point p1 = touch.getPoint();
+    const TS_Point p2 = touch.getPoint();
 
-    const int32_t mappedX = map(point.y, kTouchMinY, kTouchMaxY, 0, kScreenWidth - 1);
-    const int32_t mappedY = map(point.x, kTouchMinX, kTouchMaxX, 0, kScreenHeight - 1);
+    const int32_t rawX = (static_cast<int32_t>(p1.x) + static_cast<int32_t>(p2.x)) / 2;
+    const int32_t rawY = (static_cast<int32_t>(p1.y) + static_cast<int32_t>(p2.y)) / 2;
 
-    data->point.x = static_cast<lv_coord_t>(
-        constrain(mappedX, 0, static_cast<int32_t>(kScreenWidth - 1)));
-    data->point.y = static_cast<lv_coord_t>(
-        constrain(mappedY, 0, static_cast<int32_t>(kScreenHeight - 1)));
+    const int32_t srcX = kTouchSwapXY ? rawY : rawX;
+    const int32_t srcY = kTouchSwapXY ? rawX : rawY;
+
+    const int32_t srcXMin = kTouchSwapXY ? kTouchRawMinY : kTouchRawMinX;
+    const int32_t srcXMax = kTouchSwapXY ? kTouchRawMaxY : kTouchRawMaxX;
+    const int32_t srcYMin = kTouchSwapXY ? kTouchRawMinX : kTouchRawMinY;
+    const int32_t srcYMax = kTouchSwapXY ? kTouchRawMaxX : kTouchRawMaxY;
+
+    int32_t mappedX = map(srcX, srcXMin, srcXMax, 0, kScreenWidth - 1);
+    int32_t mappedY = map(srcY, srcYMin, srcYMax, 0, kScreenHeight - 1);
+
+    if (kTouchInvertX) {
+        mappedX = (kScreenWidth - 1) - mappedX;
+    }
+
+    if (kTouchInvertY) {
+        mappedY = (kScreenHeight - 1) - mappedY;
+    }
+
+    mappedX = constrain(mappedX, 0, static_cast<int32_t>(kScreenWidth - 1));
+    mappedY = constrain(mappedY, 0, static_cast<int32_t>(kScreenHeight - 1));
+
+    if (!active) {
+        lastX = mappedX;
+        lastY = mappedY;
+        active = true;
+    } else {
+        lastX = (lastX + mappedX * 2) / 3;
+        lastY = (lastY + mappedY * 2) / 3;
+    }
+
+    data->point.x = static_cast<lv_coord_t>(lastX);
+    data->point.y = static_cast<lv_coord_t>(lastY);
     data->state = LV_INDEV_STATE_PR;
 }
 
 void buildUi() {
-    GuiLockGuard lock;
-
     lv_obj_t* tabview = lv_tabview_create(lv_scr_act(), LV_DIR_TOP, 40);
+
+    lv_obj_t* content = lv_tabview_get_content(tabview);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLL_MOMENTUM);
+    lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_scroll_dir(content, LV_DIR_HOR);
 
     lv_obj_t* tabClock = lv_tabview_add_tab(tabview, "Clock");
     lv_obj_t* tabWeather = lv_tabview_add_tab(tabview, "Weather");
@@ -210,23 +285,36 @@ void buildUi() {
     lv_obj_align(labelDev, LV_ALIGN_CENTER, 0, 0);
 }
 
-void updateDashboardLabels(
-    const char* timeText,
-    const char* weatherText,
-    const char* usdText,
-    const char* serverStatusText
-) {
+void applyPendingUiUpdateIfAny() {
+    DashboardData localCopy{};
+    if (!takePendingDashboardData(localCopy)) {
+        return;
+    }
+
     char financeText[24];
-    char devText[32];
+    char devText[40];
 
-    snprintf(financeText, sizeof(financeText), "USD: %s", usdText);
-    snprintf(devText, sizeof(devText), "Server: %s", serverStatusText);
+    snprintf(financeText, sizeof(financeText), "USD: %s", localCopy.usd);
+    snprintf(devText, sizeof(devText), "Server: %s", localCopy.status);
 
-    GuiLockGuard lock;
-    setLabelText(labelTime, timeText);
-    setLabelText(labelWeather, weatherText);
-    setLabelText(labelFinance, financeText);
-    setLabelText(labelDev, devText);
+    if (labelTime != nullptr) {
+        lv_label_set_text(labelTime, localCopy.time);
+    }
+    if (labelWeather != nullptr) {
+        lv_label_set_text(labelWeather, localCopy.weather);
+    }
+    if (labelFinance != nullptr) {
+        lv_label_set_text(labelFinance, financeText);
+    }
+    if (labelDev != nullptr) {
+        lv_label_set_text(labelDev, devText);
+    }
+}
+
+void pumpUiOnce() {
+    updateLvglTick();
+    applyPendingUiUpdateIfAny();
+    lv_timer_handler();
 }
 
 void connectToWiFi() {
@@ -235,7 +323,7 @@ void connectToWiFi() {
     }
 
     startWiFiStation();
-    setLabelTextSafe(labelDev, "WiFi: connecting...");
+    setPendingStatus("connecting...");
 
     const uint32_t startMs = millis();
 
@@ -246,26 +334,27 @@ void connectToWiFi() {
 
     if (isWiFiConnected()) {
         Serial.println("WiFi connected");
-        setLabelTextSafe(labelDev, "Server: waiting...");
+        setPendingStatus("waiting...");
     } else {
         Serial.println("WiFi connection failed");
-        setLabelTextSafe(labelDev, "WiFi: failed");
+        setPendingStatus("WiFi failed");
     }
 }
 
 void fetchDataFromServer() {
     if (!isWiFiConnected()) {
-        setLabelTextSafe(labelDev, "WiFi: offline");
+        setPendingStatus("WiFi offline");
         return;
     }
 
+    WiFiClient client;
     HTTPClient http;
     http.setConnectTimeout(kHttpTimeoutMs);
     http.setTimeout(kHttpTimeoutMs);
 
-    if (!http.begin(kServerUrl)) {
+    if (!http.begin(client, kServerUrl)) {
         Serial.println("HTTP begin failed");
-        setLabelTextSafe(labelDev, "HTTP: init failed");
+        setPendingStatus("HTTP init fail");
         return;
     }
 
@@ -273,7 +362,7 @@ void fetchDataFromServer() {
 
     if (httpResponseCode != HTTP_CODE_OK) {
         Serial.printf("HTTP error: %d\n", httpResponseCode);
-        setLabelTextSafe(labelDev, "Server: offline");
+        setPendingStatus("server offline");
         http.end();
         return;
     }
@@ -285,7 +374,7 @@ void fetchDataFromServer() {
     if (error) {
         Serial.print("JSON parse failed: ");
         Serial.println(error.c_str());
-        setLabelTextSafe(labelDev, "JSON: parse error");
+        setPendingStatus("JSON error");
         return;
     }
 
@@ -294,14 +383,14 @@ void fetchDataFromServer() {
     const char* usdText = doc["usd"] | "N/A";
     const char* serverStatusText = doc["status"] | "Online";
 
-    updateDashboardLabels(timeText, weatherText, usdText, serverStatusText);
+    setPendingDashboardData(timeText, weatherText, usdText, serverStatusText);
 }
 
 [[noreturn]] void runNetworkLoop() {
     for (;;) {
         if (!isWiFiConnected()) {
             reconnectWiFi();
-            setLabelTextSafe(labelDev, "WiFi: reconnecting...");
+            setPendingStatus("reconnecting...");
             vTaskDelay(pdMS_TO_TICKS(kReconnectDelayMs));
             continue;
         }
@@ -347,13 +436,15 @@ void setupLvgl() {
     lv_indev_drv_init(&indevDrv);
     indevDrv.type = LV_INDEV_TYPE_POINTER;
     indevDrv.read_cb = touchpadRead;
+    indevDrv.scroll_limit = 3;
+    indevDrv.scroll_throw = 24;
     lv_indev_drv_register(&indevDrv);
 }
 
-void setupGuiMutex() {
-    guiMutex = xSemaphoreCreateMutex();
-    if (guiMutex == nullptr) {
-        haltSystem("Fatal: GUI mutex failed");
+void setupDataMutex() {
+    dataMutex = xSemaphoreCreateMutex();
+    if (dataMutex == nullptr) {
+        haltSystem("Fatal: data mutex failed");
     }
 }
 
@@ -369,14 +460,14 @@ void setupNetworkTask() {
     );
 
     if (result != pdPASS || networkTaskHandle == nullptr) {
-        haltSystem("Fatal: Network task failed");
+        haltSystem("Fatal: network task failed");
     }
 }
 
 void setup() {
     Serial.begin(115200);
 
-    setupGuiMutex();
+    setupDataMutex();
     setupDisplayAndTouch();
     setupLvgl();
     buildUi();
