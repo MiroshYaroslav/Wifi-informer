@@ -6,10 +6,12 @@
 #include <lvgl.h>
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
+#include <PubSubClient.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <ctime>
+#include <cstring>
 
 #include "secrets.h"
 
@@ -17,19 +19,31 @@ LV_FONT_DECLARE(font_20);
 LV_FONT_DECLARE(font_32);
 
 namespace {
-constexpr char kServerUrl[] = "http://192.168.0.103:8000/api/dashboard";
+constexpr char kBackendHost[] = "192.168.0.103";
+constexpr uint16_t kBackendPort = 8000;
+constexpr uint16_t kMqttPort = 1883;
+
+constexpr char kDashboardPath[] = "/api/dashboard";
+constexpr char kTogglePath[] = "/api/smarthome/toggle?device=";
+constexpr char kMqttTopicState[] = "smart/dashboard/state";
+constexpr char kMqttClientId[] = "cyd-dashboard";
 
 constexpr char kNtpServer[] = "pool.ntp.org";
 constexpr char kTimezone[] = "EET-2EEST,M3.5.0/3,M10.5.0/4";
 
+constexpr char kDeviceKomp[] = "komp_iuter";
+constexpr char kDeviceSvitlo[] = "svitlo";
+
 constexpr uint16_t kScreenWidth = 320;
 constexpr uint16_t kScreenHeight = 240;
 
-constexpr uint32_t kUpdateIntervalMs = 5 * 60 * 1000;
+constexpr uint32_t kDashboardPollIntervalMs = 3000;
 constexpr uint32_t kWifiConnectTimeoutMs = 10000;
 constexpr uint16_t kHttpTimeoutMs = 2500;
 constexpr uint16_t kUiLoopDelayMs = 1;
-constexpr uint32_t kReconnectDelayMs = 5000;
+constexpr uint32_t kReconnectDelayMs = 3000;
+constexpr uint32_t kNetworkLoopDelayMs = 25;
+constexpr uint32_t kSwitchAckTimeoutMs = 3000;
 
 constexpr uint8_t kTouchIrq = 36;
 constexpr uint8_t kTouchMosi = 32;
@@ -49,14 +63,18 @@ constexpr bool kTouchInvertY = false;
 constexpr uint16_t kDrawBufferLines = 25;
 constexpr size_t kDrawBufferSize = kScreenWidth * kDrawBufferLines;
 
-constexpr size_t kJsonCapacity = JSON_OBJECT_SIZE(5) + 256;
+constexpr size_t kDashboardJsonCapacity = JSON_OBJECT_SIZE(6) + JSON_OBJECT_SIZE(2) + 384;
+constexpr size_t kMqttJsonCapacity = JSON_OBJECT_SIZE(6) + JSON_OBJECT_SIZE(2) + 384;
 
-constexpr uint32_t kNetworkTaskStackSize = 6144;
+constexpr uint32_t kNetworkTaskStackSize = 8192;
 constexpr UBaseType_t kNetworkTaskPriority = 1;
 
 TFT_eSPI tft;
 SPIClass touchSpi(HSPI);
 XPT2046_Touchscreen touch(kTouchCs, kTouchIrq);
+
+WiFiClient mqttWifiClient;
+PubSubClient mqttClient(mqttWifiClient);
 
 lv_disp_draw_buf_t drawBuffer{};
 lv_color_t drawBufferPixels[kDrawBufferSize];
@@ -67,20 +85,32 @@ lv_obj_t* labelWeather = nullptr;
 lv_obj_t* labelCity = nullptr;
 lv_obj_t* labelFuel = nullptr;
 lv_obj_t* labelRates = nullptr;
-lv_obj_t* labelDev = nullptr;
+lv_obj_t* swKomp = nullptr;
+lv_obj_t* swSvitlo = nullptr;
 
 SemaphoreHandle_t dataMutex = nullptr;
 TaskHandle_t networkTaskHandle = nullptr;
 
 uint32_t lastLvglTickMs = 0;
 bool timeSyncStarted = false;
+bool isApplyingSwitchState = false;
+
+bool reqToggleKomp = false;
+bool reqToggleSvitlo = false;
+
+bool localKompTogglePending = false;
+bool localSvitloTogglePending = false;
+uint32_t localKompToggleDeadlineMs = 0;
+uint32_t localSvitloToggleDeadlineMs = 0;
 
 struct DashboardData {
     char weather[64];
     char usd[16];
     char eur[16];
     char fuel[96];
-    char status[24];
+    char status[32];
+    bool kompOn;
+    bool svitloOn;
     bool dirty;
 };
 
@@ -90,9 +120,10 @@ DashboardData sharedData{
     "N/A",
     "Loading fuel...",
     "starting...",
+    false,
+    false,
     false
 };
-}
 
 class DataLockGuard final {
 public:
@@ -136,6 +167,14 @@ bool isWiFiConnected() {
     return WiFi.status() == WL_CONNECTED;
 }
 
+void buildHttpUrl(char* out, size_t outSize, const char* path) {
+    snprintf(out, outSize, "http://%s:%u%s", kBackendHost, kBackendPort, path);
+}
+
+void buildToggleUrl(char* out, size_t outSize, const char* device) {
+    snprintf(out, outSize, "http://%s:%u%s%s", kBackendHost, kBackendPort, kTogglePath, device);
+}
+
 void startTimeSync() {
     configTzTime(kTimezone, kNtpServer);
     timeSyncStarted = true;
@@ -166,7 +205,9 @@ void setPendingDashboardData(
     const char* usdText,
     const char* eurText,
     const char* fuelText,
-    const char* statusText
+    const char* statusText,
+    bool kompOn,
+    bool svitloOn
 ) {
     DataLockGuard lock;
     copyText(sharedData.weather, weatherText);
@@ -174,6 +215,8 @@ void setPendingDashboardData(
     copyText(sharedData.eur, eurText);
     copyText(sharedData.fuel, fuelText);
     copyText(sharedData.status, statusText);
+    sharedData.kompOn = kompOn;
+    sharedData.svitloOn = svitloOn;
     sharedData.dirty = true;
 }
 
@@ -182,7 +225,6 @@ bool takePendingDashboardData(DashboardData& out) {
     if (!sharedData.dirty) {
         return false;
     }
-
     out = sharedData;
     sharedData.dirty = false;
     return true;
@@ -192,7 +234,6 @@ void updateLvglTick() {
     const uint32_t now = millis();
     const uint32_t elapsed = now - lastLvglTickMs;
     lastLvglTickMs = now;
-
     if (elapsed > 0) {
         lv_tick_inc(elapsed);
     }
@@ -288,6 +329,28 @@ void updateTimeLabelCb(lv_timer_t*) {
     lv_label_set_text(labelDate, dateStr);
 }
 
+void swKompEventCb(lv_event_t* event) {
+    if (isApplyingSwitchState || lv_event_get_code(event) != LV_EVENT_VALUE_CHANGED) {
+        return;
+    }
+
+    DataLockGuard lock;
+    reqToggleKomp = true;
+    localKompTogglePending = true;
+    localKompToggleDeadlineMs = millis() + kSwitchAckTimeoutMs;
+}
+
+void swSvitloEventCb(lv_event_t* event) {
+    if (isApplyingSwitchState || lv_event_get_code(event) != LV_EVENT_VALUE_CHANGED) {
+        return;
+    }
+
+    DataLockGuard lock;
+    reqToggleSvitlo = true;
+    localSvitloTogglePending = true;
+    localSvitloToggleDeadlineMs = millis() + kSwitchAckTimeoutMs;
+}
+
 void buildUi() {
     lv_obj_t* tabview = lv_tabview_create(lv_scr_act(), LV_DIR_TOP, 40);
 
@@ -300,12 +363,12 @@ void buildUi() {
     lv_obj_t* tabClock = lv_tabview_add_tab(tabview, "Clock");
     lv_obj_t* tabWeather = lv_tabview_add_tab(tabview, "Weather");
     lv_obj_t* tabFinance = lv_tabview_add_tab(tabview, "Finance");
-    lv_obj_t* tabDev = lv_tabview_add_tab(tabview, "Dev");
+    lv_obj_t* tabSmart = lv_tabview_add_tab(tabview, "Smart");
 
     lv_obj_clear_flag(tabClock, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(tabWeather, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(tabFinance, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(tabDev, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tabSmart, LV_OBJ_FLAG_SCROLLABLE);
 
     labelTime = lv_label_create(tabClock);
     lv_obj_set_width(labelTime, LV_PCT(100));
@@ -363,9 +426,23 @@ void buildUi() {
     lv_obj_align_to(labelRates, titleRates, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 5);
     lv_label_set_text(labelRates, "Loading...");
 
-    labelDev = lv_label_create(tabDev);
-    lv_label_set_text(labelDev, "System: starting...");
-    lv_obj_align(labelDev, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_t* lblKomp = lv_label_create(tabSmart);
+    lv_obj_set_style_text_font(lblKomp, &font_20, 0);
+    lv_label_set_text(lblKomp, "PC Power");
+    lv_obj_align(lblKomp, LV_ALIGN_TOP_LEFT, 20, 30);
+
+    swKomp = lv_switch_create(tabSmart);
+    lv_obj_align(swKomp, LV_ALIGN_TOP_RIGHT, -20, 24);
+    lv_obj_add_event_cb(swKomp, swKompEventCb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+    lv_obj_t* lblSvitlo = lv_label_create(tabSmart);
+    lv_obj_set_style_text_font(lblSvitlo, &font_20, 0);
+    lv_label_set_text(lblSvitlo, "Light");
+    lv_obj_align(lblSvitlo, LV_ALIGN_TOP_LEFT, 20, 95);
+
+    swSvitlo = lv_switch_create(tabSmart);
+    lv_obj_align(swSvitlo, LV_ALIGN_TOP_RIGHT, -20, 89);
+    lv_obj_add_event_cb(swSvitlo, swSvitloEventCb, LV_EVENT_VALUE_CHANGED, nullptr);
 
     lv_timer_create(updateTimeLabelCb, 1000, nullptr);
 }
@@ -377,10 +454,7 @@ void applyPendingUiUpdateIfAny() {
     }
 
     char ratesText[64];
-    char devText[40];
-
     snprintf(ratesText, sizeof(ratesText), "USD: %s\nEUR: %s", localCopy.usd, localCopy.eur);
-    snprintf(devText, sizeof(devText), "Server: %s", localCopy.status);
 
     if (labelWeather != nullptr && labelCity != nullptr) {
         char weatherBuffer[64];
@@ -403,9 +477,48 @@ void applyPendingUiUpdateIfAny() {
     if (labelRates != nullptr) {
         lv_label_set_text(labelRates, ratesText);
     }
-    if (labelDev != nullptr) {
-        lv_label_set_text(labelDev, devText);
+
+    const uint32_t now = millis();
+
+    isApplyingSwitchState = true;
+
+    if (swKomp != nullptr) {
+        const bool current = lv_obj_has_state(swKomp, LV_STATE_CHECKED);
+
+        if (localKompTogglePending) {
+            if (localCopy.kompOn == current || static_cast<int32_t>(now - localKompToggleDeadlineMs) >= 0) {
+                localKompTogglePending = false;
+            }
+        }
+
+        if (!localKompTogglePending && current != localCopy.kompOn) {
+            if (localCopy.kompOn) {
+                lv_obj_add_state(swKomp, LV_STATE_CHECKED);
+            } else {
+                lv_obj_clear_state(swKomp, LV_STATE_CHECKED);
+            }
+        }
     }
+
+    if (swSvitlo != nullptr) {
+        const bool current = lv_obj_has_state(swSvitlo, LV_STATE_CHECKED);
+
+        if (localSvitloTogglePending) {
+            if (localCopy.svitloOn == current || static_cast<int32_t>(now - localSvitloToggleDeadlineMs) >= 0) {
+                localSvitloTogglePending = false;
+            }
+        }
+
+        if (!localSvitloTogglePending && current != localCopy.svitloOn) {
+            if (localCopy.svitloOn) {
+                lv_obj_add_state(swSvitlo, LV_STATE_CHECKED);
+            } else {
+                lv_obj_clear_state(swSvitlo, LV_STATE_CHECKED);
+            }
+        }
+    }
+
+    isApplyingSwitchState = false;
 }
 
 void pumpUiOnce() {
@@ -414,99 +527,168 @@ void pumpUiOnce() {
     lv_timer_handler();
 }
 
+void parseDashboardJson(JsonDocument& doc) {
+    const char* weatherText = doc["weather"] | "N/A";
+    const char* usdText = doc["usd"] | "N/A";
+    const char* eurText = doc["eur"] | "N/A";
+    const char* fuelText = doc["fuel"] | "N/A";
+    const char* statusText = doc["status"] | "Online";
+
+    const bool kompOn = doc["smarthome"]["komp_iuter"] | false;
+    const bool svitloOn = doc["smarthome"]["svitlo"] | false;
+
+    setPendingDashboardData(weatherText, usdText, eurText, fuelText, statusText, kompOn, svitloOn);
+}
+
+void mqttCallback(char*, uint8_t* payload, unsigned int length) {
+    StaticJsonDocument<kMqttJsonCapacity> doc;
+    const DeserializationError error = deserializeJson(doc, payload, length);
+    if (error) {
+        return;
+    }
+    parseDashboardJson(doc);
+}
+
+bool connectMqtt() {
+    if (!isWiFiConnected()) {
+        return false;
+    }
+
+    if (mqttClient.connected()) {
+        return true;
+    }
+
+    if (!mqttClient.connect(kMqttClientId)) {
+        return false;
+    }
+
+    mqttClient.subscribe(kMqttTopicState);
+    return true;
+}
+
 void connectToWiFi() {
     if (isWiFiConnected()) {
         return;
     }
 
     startWiFiStation();
-    setPendingStatus("connecting...");
+    setPendingStatus("wifi connecting");
 
     const uint32_t startMs = millis();
-
     while (!isWiFiConnected() && (millis() - startMs) < kWifiConnectTimeoutMs) {
         pumpUiOnce();
         delay(kUiLoopDelayMs);
     }
 
     if (isWiFiConnected()) {
-        Serial.println("WiFi connected");
-        setPendingStatus("waiting...");
         startTimeSync();
-        Serial.println("NTP time sync started");
-    } else {
-        Serial.println("WiFi connection failed");
-        setPendingStatus("WiFi failed");
     }
 }
 
-void fetchDataFromServer() {
+bool fetchDataFromServer() {
     if (!isWiFiConnected()) {
-        setPendingStatus("WiFi offline");
-        return;
+        return false;
     }
+
+    char url[128];
+    buildHttpUrl(url, sizeof(url), kDashboardPath);
 
     WiFiClient client;
     HTTPClient http;
     http.setConnectTimeout(kHttpTimeoutMs);
     http.setTimeout(kHttpTimeoutMs);
 
-    if (!http.begin(client, kServerUrl)) {
-        Serial.println("HTTP begin failed");
-        setPendingStatus("HTTP init fail");
-        return;
+    if (!http.begin(client, url)) {
+        return false;
     }
 
-    const int httpResponseCode = http.GET();
-
-    if (httpResponseCode != HTTP_CODE_OK) {
-        Serial.printf("HTTP error: %d\n", httpResponseCode);
-        setPendingStatus("server offline");
+    const int code = http.GET();
+    if (code != HTTP_CODE_OK) {
         http.end();
-        return;
+        return false;
     }
 
-    StaticJsonDocument<kJsonCapacity> doc;
+    StaticJsonDocument<kDashboardJsonCapacity> doc;
     const DeserializationError error = deserializeJson(doc, http.getStream());
     http.end();
 
     if (error) {
-        Serial.print("JSON parse failed: ");
-        Serial.println(error.c_str());
-        setPendingStatus("JSON error");
-        return;
+        return false;
     }
 
-    const char* weatherText = doc["weather"] | "N/A";
-    const char* usdText = doc["usd"] | "N/A";
-    const char* eurText = doc["eur"] | "N/A";
-    const char* fuelText = doc["fuel"] | "N/A";
-    const char* serverStatusText = doc["status"] | "Online";
+    parseDashboardJson(doc);
+    return true;
+}
 
-    setPendingDashboardData(weatherText, usdText, eurText, fuelText, serverStatusText);
+bool sendToggleCommand(const char* device) {
+    if (!isWiFiConnected()) {
+        return false;
+    }
+
+    char url[160];
+    buildToggleUrl(url, sizeof(url), device);
+
+    WiFiClient client;
+    HTTPClient http;
+    http.setConnectTimeout(kHttpTimeoutMs);
+    http.setTimeout(kHttpTimeoutMs);
+
+    if (!http.begin(client, url)) {
+        return false;
+    }
+
+    const int code = http.POST("");
+    http.end();
+
+    return code == HTTP_CODE_OK;
 }
 
 [[noreturn]] void runNetworkLoop() {
-    bool wasConnected = isWiFiConnected();
+    uint32_t lastDashboardPollMs = millis() - kDashboardPollIntervalMs;
+    bool hadWifi = isWiFiConnected();
 
     for (;;) {
-        const bool connected = isWiFiConnected();
-
-        if (!connected) {
+        if (!isWiFiConnected()) {
             reconnectWiFi();
-            setPendingStatus("reconnecting...");
-            wasConnected = false;
+            hadWifi = false;
             vTaskDelay(pdMS_TO_TICKS(kReconnectDelayMs));
             continue;
         }
 
-        if (!wasConnected) {
+        if (!hadWifi) {
             startTimeSync();
-            wasConnected = true;
+            hadWifi = true;
+            lastDashboardPollMs = millis() - kDashboardPollIntervalMs;
         }
 
-        fetchDataFromServer();
-        vTaskDelay(pdMS_TO_TICKS(kUpdateIntervalMs));
+        connectMqtt();
+        if (mqttClient.connected()) {
+            mqttClient.loop();
+        }
+
+        bool toggleKomp = false;
+        bool toggleSvitlo = false;
+        {
+            DataLockGuard lock;
+            toggleKomp = reqToggleKomp;
+            toggleSvitlo = reqToggleSvitlo;
+            reqToggleKomp = false;
+            reqToggleSvitlo = false;
+        }
+
+        if (toggleKomp) {
+            sendToggleCommand(kDeviceKomp);
+        }
+        if (toggleSvitlo) {
+            sendToggleCommand(kDeviceSvitlo);
+        }
+
+        if (millis() - lastDashboardPollMs >= kDashboardPollIntervalMs) {
+            fetchDataFromServer();
+            lastDashboardPollMs = millis();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(kNetworkLoopDelayMs));
     }
 }
 
@@ -551,6 +733,15 @@ void setupLvgl() {
     lv_indev_drv_register(&indevDrv);
 }
 
+void setupMqtt() {
+    mqttClient.setServer(kBackendHost, kMqttPort);
+    mqttClient.setCallback(mqttCallback);
+    mqttClient.setBufferSize(kMqttJsonCapacity);
+    mqttClient.setKeepAlive(15);
+    mqttClient.setSocketTimeout(2);
+}
+}  // namespace
+
 void setupDataMutex() {
     dataMutex = xSemaphoreCreateMutex();
     if (dataMutex == nullptr) {
@@ -580,11 +771,13 @@ void setup() {
     setupDataMutex();
     setupDisplayAndTouch();
     setupLvgl();
+    setupMqtt();
     buildUi();
 
     lastLvglTickMs = millis();
 
     connectToWiFi();
+    fetchDataFromServer();
     setupNetworkTask();
 }
 
