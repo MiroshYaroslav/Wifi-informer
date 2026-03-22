@@ -9,19 +9,26 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <ctime>
 
 #include "secrets.h"
 
+LV_FONT_DECLARE(font_20);
+LV_FONT_DECLARE(font_32);
+
 namespace {
-constexpr char kServerUrl[] = "http://192.168.1.100:8000/api/dashboard";
+constexpr char kServerUrl[] = "http://192.168.0.103:8000/api/dashboard";
+
+constexpr char kNtpServer[] = "pool.ntp.org";
+constexpr char kTimezone[] = "EET-2EEST,M3.5.0/3,M10.5.0/4";
 
 constexpr uint16_t kScreenWidth = 320;
 constexpr uint16_t kScreenHeight = 240;
 
-constexpr uint32_t kUpdateIntervalMs = 60000;
+constexpr uint32_t kUpdateIntervalMs = 5 * 60 * 1000;
 constexpr uint32_t kWifiConnectTimeoutMs = 10000;
 constexpr uint16_t kHttpTimeoutMs = 2500;
-constexpr uint16_t kUiLoopDelayMs = 2;
+constexpr uint16_t kUiLoopDelayMs = 1;
 constexpr uint32_t kReconnectDelayMs = 5000;
 
 constexpr uint8_t kTouchIrq = 36;
@@ -41,7 +48,8 @@ constexpr bool kTouchInvertY = false;
 
 constexpr uint16_t kDrawBufferLines = 25;
 constexpr size_t kDrawBufferSize = kScreenWidth * kDrawBufferLines;
-constexpr size_t kJsonCapacity = JSON_OBJECT_SIZE(4) + 128;
+
+constexpr size_t kJsonCapacity = JSON_OBJECT_SIZE(5) + 256;
 
 constexpr uint32_t kNetworkTaskStackSize = 6144;
 constexpr UBaseType_t kNetworkTaskPriority = 1;
@@ -54,27 +62,33 @@ lv_disp_draw_buf_t drawBuffer{};
 lv_color_t drawBufferPixels[kDrawBufferSize];
 
 lv_obj_t* labelTime = nullptr;
+lv_obj_t* labelDate = nullptr;
 lv_obj_t* labelWeather = nullptr;
-lv_obj_t* labelFinance = nullptr;
+lv_obj_t* labelCity = nullptr;
+lv_obj_t* labelFuel = nullptr;
+lv_obj_t* labelRates = nullptr;
 lv_obj_t* labelDev = nullptr;
 
 SemaphoreHandle_t dataMutex = nullptr;
 TaskHandle_t networkTaskHandle = nullptr;
 
 uint32_t lastLvglTickMs = 0;
+bool timeSyncStarted = false;
 
 struct DashboardData {
-    char time[8];
-    char weather[32];
+    char weather[64];
     char usd[16];
+    char eur[16];
+    char fuel[96];
     char status[24];
     bool dirty;
 };
 
 DashboardData sharedData{
-    "--:--",
     "Loading weather...",
     "N/A",
+    "N/A",
+    "Loading fuel...",
     "starting...",
     false
 };
@@ -111,16 +125,6 @@ void copyText(char (&dst)[N], const char* src) {
     snprintf(dst, N, "%s", src);
 }
 
-int32_t median3(const int32_t a, const int32_t b, const int32_t c) {
-    if ((a <= b && b <= c) || (c <= b && b <= a)) {
-        return b;
-    }
-    if ((b <= a && a <= c) || (c <= a && a <= b)) {
-        return a;
-    }
-    return c;
-}
-
 [[noreturn]] void haltSystem(const char* message) {
     Serial.println(message);
     for (;;) {
@@ -130,6 +134,11 @@ int32_t median3(const int32_t a, const int32_t b, const int32_t c) {
 
 bool isWiFiConnected() {
     return WiFi.status() == WL_CONNECTED;
+}
+
+void startTimeSync() {
+    configTzTime(kTimezone, kNtpServer);
+    timeSyncStarted = true;
 }
 
 void startWiFiStation() {
@@ -153,15 +162,17 @@ void setPendingStatus(const char* statusText) {
 }
 
 void setPendingDashboardData(
-    const char* timeText,
     const char* weatherText,
     const char* usdText,
+    const char* eurText,
+    const char* fuelText,
     const char* statusText
 ) {
     DataLockGuard lock;
-    copyText(sharedData.time, timeText);
     copyText(sharedData.weather, weatherText);
     copyText(sharedData.usd, usdText);
+    copyText(sharedData.eur, eurText);
+    copyText(sharedData.fuel, fuelText);
     copyText(sharedData.status, statusText);
     sharedData.dirty = true;
 }
@@ -221,18 +232,17 @@ void touchpadRead(lv_indev_drv_t*, lv_indev_data_t* data) {
     const int32_t srcX = kTouchSwapXY ? rawY : rawX;
     const int32_t srcY = kTouchSwapXY ? rawX : rawY;
 
-    const int32_t srcXMin = kTouchSwapXY ? kTouchRawMinY : kTouchRawMinX;
-    const int32_t srcXMax = kTouchSwapXY ? kTouchRawMaxY : kTouchRawMaxX;
-    const int32_t srcYMin = kTouchSwapXY ? kTouchRawMinX : kTouchRawMinY;
-    const int32_t srcYMax = kTouchSwapXY ? kTouchRawMaxX : kTouchRawMaxY;
+    constexpr int32_t kSrcXMin = kTouchSwapXY ? kTouchRawMinY : kTouchRawMinX;
+    constexpr int32_t kSrcXMax = kTouchSwapXY ? kTouchRawMaxY : kTouchRawMaxX;
+    constexpr int32_t kSrcYMin = kTouchSwapXY ? kTouchRawMinX : kTouchRawMinY;
+    constexpr int32_t kSrcYMax = kTouchSwapXY ? kTouchRawMaxX : kTouchRawMaxY;
 
-    int32_t mappedX = map(srcX, srcXMin, srcXMax, 0, kScreenWidth - 1);
-    int32_t mappedY = map(srcY, srcYMin, srcYMax, 0, kScreenHeight - 1);
+    int32_t mappedX = map(srcX, kSrcXMin, kSrcXMax, 0, kScreenWidth - 1);
+    int32_t mappedY = map(srcY, kSrcYMin, kSrcYMax, 0, kScreenHeight - 1);
 
     if (kTouchInvertX) {
         mappedX = (kScreenWidth - 1) - mappedX;
     }
-
     if (kTouchInvertY) {
         mappedY = (kScreenHeight - 1) - mappedY;
     }
@@ -245,13 +255,37 @@ void touchpadRead(lv_indev_drv_t*, lv_indev_data_t* data) {
         lastY = mappedY;
         active = true;
     } else {
-        lastX = (lastX + mappedX * 2) / 3;
+        lastX = (lastX + mappedX * 3) / 4;
         lastY = (lastY + mappedY * 2) / 3;
     }
 
     data->point.x = static_cast<lv_coord_t>(lastX);
     data->point.y = static_cast<lv_coord_t>(lastY);
     data->state = LV_INDEV_STATE_PR;
+}
+
+void updateTimeLabelCb(lv_timer_t*) {
+    if (labelTime == nullptr || labelDate == nullptr) {
+        return;
+    }
+
+    const time_t now = time(nullptr);
+    if (now < 100000 || !timeSyncStarted) {
+        lv_label_set_text(labelTime, "--:--:--");
+        lv_label_set_text(labelDate, "Syncing time...");
+        return;
+    }
+
+    struct tm timeinfo{};
+    localtime_r(&now, &timeinfo);
+
+    char timeStr[16];
+    strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
+    lv_label_set_text(labelTime, timeStr);
+
+    char dateStr[32];
+    strftime(dateStr, sizeof(dateStr), "%a, %d.%m.%Y", &timeinfo);
+    lv_label_set_text(labelDate, dateStr);
 }
 
 void buildUi() {
@@ -268,21 +302,72 @@ void buildUi() {
     lv_obj_t* tabFinance = lv_tabview_add_tab(tabview, "Finance");
     lv_obj_t* tabDev = lv_tabview_add_tab(tabview, "Dev");
 
+    lv_obj_clear_flag(tabClock, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tabWeather, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tabFinance, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tabDev, LV_OBJ_FLAG_SCROLLABLE);
+
     labelTime = lv_label_create(tabClock);
-    lv_label_set_text(labelTime, "--:--");
-    lv_obj_align(labelTime, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_width(labelTime, LV_PCT(100));
+    lv_obj_set_style_text_align(labelTime, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(labelTime, &font_32, 0);
+    lv_label_set_text(labelTime, "--:--:--");
+    lv_obj_align(labelTime, LV_ALIGN_TOP_MID, 0, 55);
+
+    labelDate = lv_label_create(tabClock);
+    lv_obj_set_width(labelDate, LV_PCT(100));
+    lv_obj_set_style_text_align(labelDate, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(labelDate, &font_20, 0);
+    lv_obj_set_style_text_color(labelDate, lv_color_hex(0xAAAAAA), 0);
+    lv_label_set_text(labelDate, "Syncing time...");
+    lv_obj_align(labelDate, LV_ALIGN_TOP_MID, 0, 105);
 
     labelWeather = lv_label_create(tabWeather);
-    lv_label_set_text(labelWeather, "Loading weather...");
-    lv_obj_align(labelWeather, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_width(labelWeather, LV_PCT(100));
+    lv_obj_set_style_text_align(labelWeather, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(labelWeather, &font_32, 0);
+    lv_label_set_text(labelWeather, "Loading...");
+    lv_obj_align(labelWeather, LV_ALIGN_TOP_MID, 0, 55);
 
-    labelFinance = lv_label_create(tabFinance);
-    lv_label_set_text(labelFinance, "Loading rates...");
-    lv_obj_align(labelFinance, LV_ALIGN_CENTER, 0, 0);
+    labelCity = lv_label_create(tabWeather);
+    lv_obj_set_width(labelCity, LV_PCT(100));
+    lv_obj_set_style_text_align(labelCity, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(labelCity, &font_20, 0);
+    lv_obj_set_style_text_color(labelCity, lv_color_hex(0xAAAAAA), 0);
+    lv_label_set_text(labelCity, "");
+    lv_obj_align(labelCity, LV_ALIGN_TOP_MID, 0, 105);
+
+    lv_obj_t* titleFuel = lv_label_create(tabFinance);
+    lv_obj_set_style_text_font(titleFuel, &font_20, 0);
+    lv_obj_set_style_text_color(titleFuel, lv_color_hex(0x888888), 0);
+    lv_label_set_text(titleFuel, "FUEL (UAH)");
+    lv_obj_align(titleFuel, LV_ALIGN_TOP_LEFT, 5, 10);
+
+    labelFuel = lv_label_create(tabFinance);
+    lv_obj_set_style_text_font(labelFuel, &font_20, 0);
+    lv_obj_set_width(labelFuel, 140);
+    lv_label_set_long_mode(labelFuel, LV_LABEL_LONG_WRAP);
+    lv_obj_align_to(labelFuel, titleFuel, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 5);
+    lv_label_set_text(labelFuel, "Loading...");
+
+    lv_obj_t* titleRates = lv_label_create(tabFinance);
+    lv_obj_set_style_text_font(titleRates, &font_20, 0);
+    lv_obj_set_style_text_color(titleRates, lv_color_hex(0x888888), 0);
+    lv_label_set_text(titleRates, "RATES (UAH)");
+    lv_obj_align(titleRates, LV_ALIGN_TOP_LEFT, 155, 10);
+
+    labelRates = lv_label_create(tabFinance);
+    lv_obj_set_style_text_font(labelRates, &font_20, 0);
+    lv_obj_set_width(labelRates, 140);
+    lv_label_set_long_mode(labelRates, LV_LABEL_LONG_WRAP);
+    lv_obj_align_to(labelRates, titleRates, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 5);
+    lv_label_set_text(labelRates, "Loading...");
 
     labelDev = lv_label_create(tabDev);
     lv_label_set_text(labelDev, "System: starting...");
     lv_obj_align(labelDev, LV_ALIGN_CENTER, 0, 0);
+
+    lv_timer_create(updateTimeLabelCb, 1000, nullptr);
 }
 
 void applyPendingUiUpdateIfAny() {
@@ -291,20 +376,32 @@ void applyPendingUiUpdateIfAny() {
         return;
     }
 
-    char financeText[24];
+    char ratesText[64];
     char devText[40];
 
-    snprintf(financeText, sizeof(financeText), "USD: %s", localCopy.usd);
+    snprintf(ratesText, sizeof(ratesText), "USD: %s\nEUR: %s", localCopy.usd, localCopy.eur);
     snprintf(devText, sizeof(devText), "Server: %s", localCopy.status);
 
-    if (labelTime != nullptr) {
-        lv_label_set_text(labelTime, localCopy.time);
+    if (labelWeather != nullptr && labelCity != nullptr) {
+        char weatherBuffer[64];
+        copyText(weatherBuffer, localCopy.weather);
+
+        char* newline = strchr(weatherBuffer, '\n');
+        if (newline != nullptr) {
+            *newline = '\0';
+            lv_label_set_text(labelCity, weatherBuffer);
+            lv_label_set_text(labelWeather, newline + 1);
+        } else {
+            lv_label_set_text(labelWeather, weatherBuffer);
+            lv_label_set_text(labelCity, "");
+        }
     }
-    if (labelWeather != nullptr) {
-        lv_label_set_text(labelWeather, localCopy.weather);
+
+    if (labelFuel != nullptr) {
+        lv_label_set_text(labelFuel, localCopy.fuel);
     }
-    if (labelFinance != nullptr) {
-        lv_label_set_text(labelFinance, financeText);
+    if (labelRates != nullptr) {
+        lv_label_set_text(labelRates, ratesText);
     }
     if (labelDev != nullptr) {
         lv_label_set_text(labelDev, devText);
@@ -335,6 +432,8 @@ void connectToWiFi() {
     if (isWiFiConnected()) {
         Serial.println("WiFi connected");
         setPendingStatus("waiting...");
+        startTimeSync();
+        Serial.println("NTP time sync started");
     } else {
         Serial.println("WiFi connection failed");
         setPendingStatus("WiFi failed");
@@ -378,21 +477,32 @@ void fetchDataFromServer() {
         return;
     }
 
-    const char* timeText = doc["time"] | "--:--";
     const char* weatherText = doc["weather"] | "N/A";
     const char* usdText = doc["usd"] | "N/A";
+    const char* eurText = doc["eur"] | "N/A";
+    const char* fuelText = doc["fuel"] | "N/A";
     const char* serverStatusText = doc["status"] | "Online";
 
-    setPendingDashboardData(timeText, weatherText, usdText, serverStatusText);
+    setPendingDashboardData(weatherText, usdText, eurText, fuelText, serverStatusText);
 }
 
 [[noreturn]] void runNetworkLoop() {
+    bool wasConnected = isWiFiConnected();
+
     for (;;) {
-        if (!isWiFiConnected()) {
+        const bool connected = isWiFiConnected();
+
+        if (!connected) {
             reconnectWiFi();
             setPendingStatus("reconnecting...");
+            wasConnected = false;
             vTaskDelay(pdMS_TO_TICKS(kReconnectDelayMs));
             continue;
+        }
+
+        if (!wasConnected) {
+            startTimeSync();
+            wasConnected = true;
         }
 
         fetchDataFromServer();
@@ -436,8 +546,8 @@ void setupLvgl() {
     lv_indev_drv_init(&indevDrv);
     indevDrv.type = LV_INDEV_TYPE_POINTER;
     indevDrv.read_cb = touchpadRead;
-    indevDrv.scroll_limit = 3;
-    indevDrv.scroll_throw = 24;
+    indevDrv.scroll_limit = 2;
+    indevDrv.scroll_throw = 28;
     lv_indev_drv_register(&indevDrv);
 }
 
