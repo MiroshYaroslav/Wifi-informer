@@ -19,7 +19,7 @@ LV_FONT_DECLARE(font_20);
 LV_FONT_DECLARE(font_32);
 
 namespace {
-constexpr char kBackendHost[] = "192.168.0.103";
+constexpr char kBackendHost[] = "192.168.0.116";
 constexpr uint16_t kBackendPort = 8000;
 constexpr uint16_t kMqttPort = 1883;
 
@@ -37,7 +37,7 @@ constexpr char kDeviceSvitlo[] = "svitlo";
 constexpr uint16_t kScreenWidth = 320;
 constexpr uint16_t kScreenHeight = 240;
 
-constexpr uint32_t kDashboardPollIntervalMs = 3000;
+constexpr uint32_t kDashboardPollIntervalMs = 5 * 60 * 1000;
 constexpr uint32_t kWifiConnectTimeoutMs = 10000;
 constexpr uint16_t kHttpTimeoutMs = 2500;
 constexpr uint16_t kUiLoopDelayMs = 1;
@@ -63,8 +63,8 @@ constexpr bool kTouchInvertY = false;
 constexpr uint16_t kDrawBufferLines = 25;
 constexpr size_t kDrawBufferSize = kScreenWidth * kDrawBufferLines;
 
-constexpr size_t kDashboardJsonCapacity = JSON_OBJECT_SIZE(6) + JSON_OBJECT_SIZE(2) + 384;
-constexpr size_t kMqttJsonCapacity = JSON_OBJECT_SIZE(6) + JSON_OBJECT_SIZE(2) + 384;
+constexpr size_t kDashboardJsonCapacity = 1024;
+constexpr size_t kMqttJsonCapacity = 1024;
 
 constexpr uint32_t kNetworkTaskStackSize = 8192;
 constexpr UBaseType_t kNetworkTaskPriority = 1;
@@ -429,19 +429,25 @@ void buildUi() {
     lv_obj_t* lblKomp = lv_label_create(tabSmart);
     lv_obj_set_style_text_font(lblKomp, &font_20, 0);
     lv_label_set_text(lblKomp, "PC Power");
-    lv_obj_align(lblKomp, LV_ALIGN_TOP_LEFT, 20, 30);
+    lv_obj_align(lblKomp, LV_ALIGN_TOP_LEFT, 20, 40);
 
     swKomp = lv_switch_create(tabSmart);
-    lv_obj_align(swKomp, LV_ALIGN_TOP_RIGHT, -20, 24);
+    lv_obj_set_size(swKomp, 80, 40);
+    lv_obj_set_ext_click_area(swKomp, 20);
+    lv_obj_clear_flag(swKomp, LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_align(swKomp, LV_ALIGN_TOP_RIGHT, -20, 30);
     lv_obj_add_event_cb(swKomp, swKompEventCb, LV_EVENT_VALUE_CHANGED, nullptr);
 
     lv_obj_t* lblSvitlo = lv_label_create(tabSmart);
     lv_obj_set_style_text_font(lblSvitlo, &font_20, 0);
     lv_label_set_text(lblSvitlo, "Light");
-    lv_obj_align(lblSvitlo, LV_ALIGN_TOP_LEFT, 20, 95);
+    lv_obj_align(lblSvitlo, LV_ALIGN_TOP_LEFT, 20, 110);
 
     swSvitlo = lv_switch_create(tabSmart);
-    lv_obj_align(swSvitlo, LV_ALIGN_TOP_RIGHT, -20, 89);
+    lv_obj_set_size(swSvitlo, 80, 40);
+    lv_obj_set_ext_click_area(swSvitlo, 20);
+    lv_obj_clear_flag(swSvitlo, LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_align(swSvitlo, LV_ALIGN_TOP_RIGHT, -20, 100);
     lv_obj_add_event_cb(swSvitlo, swSvitloEventCb, LV_EVENT_VALUE_CHANGED, nullptr);
 
     lv_timer_create(updateTimeLabelCb, 1000, nullptr);
@@ -528,16 +534,17 @@ void pumpUiOnce() {
 }
 
 void parseDashboardJson(JsonDocument& doc) {
-    const char* weatherText = doc["weather"] | "N/A";
-    const char* usdText = doc["usd"] | "N/A";
-    const char* eurText = doc["eur"] | "N/A";
-    const char* fuelText = doc["fuel"] | "N/A";
-    const char* statusText = doc["status"] | "Online";
+    if (doc.containsKey("weather")) copyText(sharedData.weather, doc["weather"]);
+    if (doc.containsKey("usd")) copyText(sharedData.usd, doc["usd"]);
+    if (doc.containsKey("eur")) copyText(sharedData.eur, doc["eur"]);
+    if (doc.containsKey("fuel")) copyText(sharedData.fuel, doc["fuel"]);
+    if (doc.containsKey("status")) copyText(sharedData.status, doc["status"]);
 
-    const bool kompOn = doc["smarthome"]["komp_iuter"] | false;
-    const bool svitloOn = doc["smarthome"]["svitlo"] | false;
-
-    setPendingDashboardData(weatherText, usdText, eurText, fuelText, statusText, kompOn, svitloOn);
+    if (doc.containsKey("smarthome")) {
+        sharedData.kompOn = doc["smarthome"]["komp_iuter"] | false;
+        sharedData.svitloOn = doc["smarthome"]["svitlo"] | false;
+    }
+    sharedData.dirty = true;
 }
 
 void mqttCallback(char*, uint8_t* payload, unsigned int length) {
@@ -740,7 +747,7 @@ void setupMqtt() {
     mqttClient.setKeepAlive(15);
     mqttClient.setSocketTimeout(2);
 }
-}  // namespace
+}
 
 void setupDataMutex() {
     dataMutex = xSemaphoreCreateMutex();
