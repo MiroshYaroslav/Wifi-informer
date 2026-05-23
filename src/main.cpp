@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <esp_task_wdt.h>
+#include <ArduinoOTA.h> 
 #include "config.h"
 #include "shared.h"
 #include "ui.h"
@@ -31,6 +32,7 @@ void setup() {
     buildUi();
 
     lastTouchMs = millis();
+    
     setupNetworkTask();
 
     esp_task_wdt_init(kWatchdogTimeoutS, true);
@@ -39,6 +41,8 @@ void setup() {
 
 void loop() {
     esp_task_wdt_reset();
+
+    ArduinoOTA.handle(); 
 
     if (isScreenOn && millis() - lastTouchMs > kScreenSaverTimeoutMs) {
         analogWrite(kBacklightPin, kBrightnessDim);

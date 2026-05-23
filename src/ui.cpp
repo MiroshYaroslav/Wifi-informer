@@ -10,6 +10,8 @@
 LV_FONT_DECLARE(font_20);
 LV_FONT_DECLARE(font_32);
 
+volatile int otaProgressMode = -1;
+
 namespace {
 
 TFT_eSPI tft;
@@ -191,6 +193,33 @@ void dynamicControlEventCb(lv_event_t* event) {
 
 }
 
+void drawRawOtaProgress(int percent) {
+    int cx = kScreenWidth / 2;
+    int cy = kScreenHeight / 2;
+    if (percent == 0) {
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setTextSize(2);
+        tft.drawString("Updating Firmware...", cx, cy - 30);
+        tft.drawRect(cx - 120, cy, 240, 20, TFT_BLUE);
+    }
+    if (percent >= 100) {
+        tft.fillRect(cx - 119, cy + 1, 238, 18, TFT_GREEN);
+        tft.fillRect(cx - 50, cy + 40, 100, 30, TFT_BLACK);
+        tft.drawString("Done! Restarting...", cx, cy + 50);
+    } else {
+        int w = (238 * percent) / 100;
+        if (w > 0) {
+            tft.fillRect(cx - 119, cy + 1, w, 18, TFT_GREEN);
+        }
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d%%", percent);
+        tft.fillRect(cx - 40, cy + 40, 80, 25, TFT_BLACK);
+        tft.drawString(buf, cx, cy + 50);
+    }
+}
+
 void setupDisplayAndTouch() {
     pinMode(kBacklightPin, OUTPUT);
     analogWrite(kBacklightPin, kBrightnessMax);
@@ -238,7 +267,6 @@ void buildUi() {
 
     lv_obj_t* content = lv_tabview_get_content(tabview);
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLL_ELASTIC);
-    lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLL_MOMENTUM);
     lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_scroll_dir(content, LV_DIR_HOR);
 
@@ -502,6 +530,10 @@ void applyPendingUiUpdateIfAny() {
 }
 
 void pumpUiAndPendingData() {
+    if (otaProgressMode >= 0) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        return;
+    }
     updateLvglTick();
     applyPendingUiUpdateIfAny();
     lv_timer_handler();

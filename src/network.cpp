@@ -7,7 +7,13 @@
 #include <WiFiManager.h>
 #include <WiFiUdp.h>
 #include <Preferences.h>
+#include <ArduinoOTA.h>
 #include <ctime>
+#include <esp_task_wdt.h>
+#include <ESPmDNS.h>
+
+extern volatile int otaProgressMode;
+void drawRawOtaProgress(int percent);
 
 namespace {
 
@@ -15,6 +21,7 @@ char backendHost[20] = "";
 WiFiClient mqttWifiClient;
 PubSubClient mqttClient(mqttWifiClient);
 TaskHandle_t networkTaskHandle = nullptr;
+bool otaInitialized = false;
 
 bool isWiFiConnected() {
     return WiFi.status() == WL_CONNECTED;
@@ -23,6 +30,44 @@ bool isWiFiConnected() {
 void startTimeSync() {
     configTzTime(kTimezone, kNtpServer, "time.google.com", "time.nist.gov");
     timeSyncStarted = true;
+}
+
+void internalSetupOTA() {
+    if (otaInitialized) return;
+
+    if (!MDNS.begin("smart-dashboard")) {
+        Serial.println("Error setting up MDNS responder!");
+    }
+
+    ArduinoOTA.setHostname("smart-dashboard");
+    ArduinoOTA.setPassword("admin123");
+    ArduinoOTA.setTimeout(30000); 
+
+    ArduinoOTA.onStart([]() {
+        esp_task_wdt_delete(NULL); 
+        otaProgressMode = 0;
+        drawRawOtaProgress(0);
+    });
+    
+    ArduinoOTA.onEnd([]() {
+        otaProgressMode = 100;
+        drawRawOtaProgress(100);
+    });
+    
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        if (total > 0) {
+            int percent = (progress * 100) / total;
+            otaProgressMode = percent;
+            drawRawOtaProgress(percent);
+        }
+    });
+    
+    ArduinoOTA.onError([](ota_error_t error) {
+        otaProgressMode = -1;
+    });
+
+    ArduinoOTA.begin();
+    otaInitialized = true;
 }
 
 void setSysMessage(const char* msg) {
@@ -235,6 +280,8 @@ bool sendActionCommand(const ActionTask& task) {
         sharedData.dirty = true;
     }
 
+    internalSetupOTA();
+
     uint32_t lastTelemetryMs = 0;
     int mqttFails = 0;
     bool wasWifiConnected = isWiFiConnected();
@@ -253,6 +300,7 @@ bool sendActionCommand(const ActionTask& task) {
 
             if (trySavedNetworks()) {
                 currentReconnectDelay = kReconnectDelayMs;
+                internalSetupOTA();
             } else {
                 vTaskDelay(pdMS_TO_TICKS(currentReconnectDelay));
                 currentReconnectDelay = (currentReconnectDelay * 2 > 60000) ? 60000 : currentReconnectDelay * 2;
@@ -262,6 +310,7 @@ bool sendActionCommand(const ActionTask& task) {
 
         if (!wasWifiConnected) {
             startTimeSync();
+            internalSetupOTA();
             wasWifiConnected = true;
             currentReconnectDelay = kReconnectDelayMs;
         }
@@ -360,8 +409,6 @@ bool sendActionCommand(const ActionTask& task) {
                 }
             }
         }
-
-        setSysMessage(sysMsg);
 
         if (millis() - lastTelemetryMs >= kTelemetryIntervalMs || lastTelemetryMs == 0) {
             if (mqttOk) sendTelemetry();
